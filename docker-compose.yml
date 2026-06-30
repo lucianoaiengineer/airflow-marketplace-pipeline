@@ -1,0 +1,147 @@
+name: airflow-marketplace-pipeline
+
+# Configuração comum aos serviços do Airflow.
+# Centraliza imagem, variáveis e volumes para manter consistência entre
+# webserver, scheduler, workers e Flower.
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow/${AIRFLOW_DB_NAME:-airflow}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow/${AIRFLOW_DB_NAME:-airflow}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    DUMB_INIT_SETSID: "0"
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./include:/opt/airflow/include
+    - ./sql:/opt/airflow/sql
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  # Banco de metadados interno do Airflow.
+  postgres_airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - postgres-airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # Banco operacional usado para armazenar os dados capturados da FakeStore API.
+  postgres_marketplace:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${MARKETPLACE_DB_USER:-marketplace}
+      POSTGRES_PASSWORD: ${MARKETPLACE_DB_PASSWORD:-marketplace}
+      POSTGRES_DB: ${MARKETPLACE_DB_NAME:-marketplace}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-marketplace-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # Broker Celery usado para distribuir tasks entre os workers.
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # Serviço de inicialização do Airflow.
+  # Executa migração do banco de metadados e cria o usuário administrativo.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname "$${AIRFLOW_ADMIN_FIRST_NAME:-Luciano}" \
+          --lastname "$${AIRFLOW_ADMIN_LAST_NAME:-Magalhaes}" \
+          --role Admin \
+          --email "$${AIRFLOW_ADMIN_EMAIL:-luciano@example.com}" || true
+    depends_on:
+      postgres_airflow:
+        condition: service_healthy
+      postgres_marketplace:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Interface web do Airflow.
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Scheduler responsável por identificar e agendar execuções da DAG.
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Worker Celery responsável por executar tasks distribuídas.
+  # A quantidade de workers será controlada por docker compose --scale.
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Interface Flower para visualização dos workers Celery ativos.
+  airflow-flower:
+    <<: *airflow-common
+    command: celery flower
+    ports:
+      - "5555:5555"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres-airflow-db-volume:
+  postgres-marketplace-db-volume:
